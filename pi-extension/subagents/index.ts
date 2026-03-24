@@ -9,7 +9,6 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
-  createSurfaceSplit,
   sendCommand,
   pollForExit,
   closeSurface,
@@ -51,7 +50,7 @@ interface AgentDefaults {
 }
 
 /** Tools that are gated by `spawning: false` */
-const SPAWNING_TOOLS = new Set(["subagent", "parallel_subagents", "subagents_list", "subagent_resume"]);
+const SPAWNING_TOOLS = new Set(["subagent", "subagents_list", "subagent_resume"]);
 
 /**
  * Resolve the effective set of denied tool names from agent defaults.
@@ -762,179 +761,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── parallel_subagents tool ──
-  const ParallelSubagentEntry = Type.Object({
-    name: Type.String({ description: "Display name for this subagent" }),
-    task: Type.String({ description: "Task/prompt for the sub-agent" }),
-    agent: Type.Optional(Type.String({ description: "Agent name to load defaults from (e.g. 'scout', 'worker')" })),
-    systemPrompt: Type.Optional(Type.String({ description: "Appended to system prompt" })),
-    model: Type.Optional(Type.String({ description: "Model override" })),
-    skills: Type.Optional(Type.String({ description: "Comma-separated skills" })),
-    tools: Type.Optional(Type.String({ description: "Comma-separated tools" })),
-    cwd: Type.Optional(Type.String({ description: "Working directory for the sub-agent" })),
-  });
-
-  shouldRegister("parallel_subagents") && pi.registerTool({
-    name: "parallel_subagents",
-    label: "Parallel Subagents",
-    description:
-      "Run multiple sub-agents concurrently. Each agent spawns in its own multiplexer pane and returns immediately. " +
-      "Results steer back as each agent completes — no waiting for all to finish. " +
-      "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
-    promptSnippet:
-      "Run multiple sub-agents concurrently. Each agent spawns in its own multiplexer pane and returns immediately. " +
-      "Results steer back as each agent completes — no waiting for all to finish. " +
-      "Use for independent tasks like scouting different parts of a codebase, parallel research, or non-overlapping work.",
-    parameters: Type.Object({
-      agents: Type.Array(ParallelSubagentEntry, {
-        description: "Array of subagent configurations to run in parallel",
-        minItems: 1,
-      }),
-    }),
-
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      // Prevent self-spawning (e.g. planner spawning another planner)
-      const currentAgent = process.env.PI_SUBAGENT_AGENT;
-      if (currentAgent) {
-        const selfSpawn = params.agents.find((a) => a.agent === currentAgent);
-        if (selfSpawn) {
-          return {
-            content: [{ type: "text", text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. You were spawned to do this work yourself. Complete the task directly.` }],
-            details: { error: "self-spawn blocked" },
-          };
-        }
-      }
-
-      if (!isMuxAvailable()) {
-        return muxUnavailableResult("subagents");
-      }
-
-      if (!ctx.sessionManager.getSessionFile()) {
-        return {
-          content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
-          details: { error: "no session file" },
-        };
-      }
-
-      const total = params.agents.length;
-
-      // Pre-create all surfaces with a tiled layout:
-      // First agent splits right from the orchestrator (side-by-side),
-      // subsequent agents split down from the first (stacked vertically).
-      const surfaces: string[] = [];
-      for (let i = 0; i < params.agents.length; i++) {
-        const name = params.agents[i].name;
-        if (i === 0) {
-          surfaces.push(createSurfaceSplit(name, "right"));
-        } else {
-          surfaces.push(createSurfaceSplit(name, "down", surfaces[i - 1]));
-        }
-      }
-
-      // Brief pause for surfaces to initialize
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-
-      // Shared set of claimed session files — prevents parallel agents
-      // from all locking onto the same "newest" file during progress polling.
-      const claimedFiles = new Set<string>();
-
-      // Launch all agents and start fire-and-forget watchers
-      const launched: Array<{ id: string; name: string }> = [];
-      for (let i = 0; i < params.agents.length; i++) {
-        const agentParams = { ...params.agents[i], fork: false as const };
-        const running = await launchSubagent(agentParams, ctx, { surface: surfaces[i], claimedFiles });
-        launched.push({ id: running.id, name: running.name });
-
-        // Fire-and-forget watcher — each steers its result independently
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        watchSubagent(running, watcherAbort.signal).then((result) => {
-          updateWidget(); // reflect removal from Map immediately
-          const sessionRef = result.sessionFile
-            ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-            : "";
-          const content = result.exitCode !== 0
-            ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-            : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
-
-          pi.sendMessage({
-            customType: "subagent_result",
-            content,
-            display: true,
-            details: {
-              name: running.name,
-              task: running.task,
-              agent: running.agent,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              sessionFile: result.sessionFile,
-            },
-          }, { triggerTurn: true, deliverAs: "steer" });
-        }).catch((err) => {
-          updateWidget();
-          pi.sendMessage({
-            customType: "subagent_result",
-            content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-            display: true,
-            details: { name: running.name, task: running.task, error: err?.message },
-          }, { triggerTurn: true, deliverAs: "steer" });
-        });
-      }
-
-      // Start widget refresh after all agents are launched
-      startWidgetRefresh();
-
-      // Return immediately
-      return {
-        content: [{ type: "text", text: `${total} sub-agent${total !== 1 ? "s" : ""} started.` }],
-        details: {
-          total,
-          agents: launched,
-          status: "started",
-        },
-      };
-    },
-
-    renderCall(args, theme) {
-      const agents = args.agents ?? [];
-      let text = theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
-        theme.fg("dim", ` — ${agents.length} agent${agents.length !== 1 ? "s" : ""}`);
-
-      for (const a of agents) {
-        const agent = a.agent ? theme.fg("dim", ` (${a.agent})`) : "";
-        const task = a.task ?? "";
-        const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
-        const preview = firstLine.length > 80 ? firstLine.slice(0, 80) + "…" : firstLine;
-        text += "\n  ▹ " + theme.fg("toolOutput", a.name ?? "unnamed") + agent;
-        if (preview) text += theme.fg("dim", ` — ${preview}`);
-      }
-
-      return new Text(text, 0, 0);
-    },
-
-    renderResult(result, _opts, theme) {
-      const details = result.details as any;
-      const total = details?.total ?? 0;
-      const agents: Array<{ id: string; name: string }> = details?.agents ?? [];
-
-      if (details?.status === "started") {
-        let text = theme.fg("accent", "▸") + " " +
-          theme.fg("toolTitle", theme.bold("Parallel Subagents")) +
-          theme.fg("dim", ` — ${total} started`);
-
-        for (const a of agents) {
-          text += "\n  ▸ " + theme.fg("toolOutput", a.name);
-        }
-
-        return new Text(text, 0, 0);
-      }
-
-      // Fallback
-      const summaryText = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-      return new Text(theme.fg("dim", summaryText), 0, 0);
-    },
-  });
 
   // ── subagents_list tool ──
   shouldRegister("subagents_list") && pi.registerTool({
