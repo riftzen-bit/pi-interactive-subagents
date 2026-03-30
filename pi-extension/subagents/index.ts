@@ -68,6 +68,7 @@ interface AgentDefaults {
   denyTools?: string;
   spawning?: boolean;
   autoExit?: boolean;
+  systemPromptMode?: "append" | "replace";
   cwd?: string;
   body?: string;
 }
@@ -122,9 +123,11 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
     const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
     const spawningRaw = get("spawning");
     const autoExitRaw = get("auto-exit");
+    const spm = get("system-prompt");
     return {
       model: get("model"),
       tools: get("tools"),
+      systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
       skills: get("skill") ?? get("skills"),
       thinking: get("thinking"),
       denyTools: get("deny-tools"),
@@ -425,8 +428,11 @@ async function launchSubagent(
     : `As your FIRST action, set the tab title using set_tab_title. ` +
       `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
       `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
+  // Determine where the agent identity goes: system prompt or user message
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-  const roleBlock = identity ? `\n\n${identity}` : "";
+  const systemPromptMode = agentDefs?.systemPromptMode;
+  const identityInSystemPrompt = systemPromptMode && identity;
+  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = params.fork
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
@@ -468,6 +474,12 @@ async function launchSubagent(
   if (effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));
+  }
+
+  // Pass agent body as system prompt when configured
+  if (identityInSystemPrompt && identity) {
+    const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+    parts.push(flag, shellEscape(identity));
   }
 
   if (effectiveTools) {
