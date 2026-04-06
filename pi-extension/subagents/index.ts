@@ -241,6 +241,14 @@ let latestCtx: ExtensionContext | null = null;
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
 
+// Fix issue #5: clear stale interval from a previous /reload so timers don't accumulate.
+// We use a Symbol.for key so it survives module re-imports across reloads.
+const _WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents-widget-interval");
+if ((globalThis as any)[_WIDGET_INTERVAL_KEY]) {
+  clearInterval((globalThis as any)[_WIDGET_INTERVAL_KEY]);
+  (globalThis as any)[_WIDGET_INTERVAL_KEY] = null;
+}
+
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
   const m = Math.floor(seconds / 60);
@@ -339,6 +347,7 @@ function updateWidget() {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
+      (globalThis as any)[_WIDGET_INTERVAL_KEY] = null;
     }
     return;
   }
@@ -368,6 +377,7 @@ function startWidgetRefresh() {
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
+  (globalThis as any)[_WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
 /**
@@ -500,10 +510,14 @@ async function launchSubagent(
     parts.push("--model", shellEscape(model));
   }
 
-  // Pass agent body as system prompt when configured
+  // Pass agent body as system prompt when configured.
+  // Write to a temp file instead of inline to avoid shell escaping issues with
+  // multi-line markdown content sent through tmux send-keys (fix for issue #18).
   if (identityInSystemPrompt && identity) {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    parts.push(flag, shellEscape(identity));
+    const promptFile = join(tmpdir(), `pi-subagent-prompt-${id}.md`);
+    writeFileSync(promptFile, identity, "utf8");
+    parts.push(flag, `@${promptFile}`);
   }
 
   if (effectiveTools) {
@@ -689,6 +703,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
+      (globalThis as any)[_WIDGET_INTERVAL_KEY] = null;
     }
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();

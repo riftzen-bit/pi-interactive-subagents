@@ -200,7 +200,8 @@ export function createSurface(name: string): string {
     cmuxSubagentPane = null;
   }
 
-  const surface = createSurfaceSplit(name, "right");
+  // For tmux, target the pane where pi is running (fix: split targets wrong window when focus is elsewhere)
+  const surface = createSurfaceSplit(name, "right", backend === "tmux" ? process.env.TMUX_PANE : undefined);
 
   // For cmux, remember the pane so future subagents become tabs in it
   if (backend === "cmux") {
